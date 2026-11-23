@@ -2,6 +2,13 @@ name: Collaboration demo
 
 on:
   workflow_dispatch:
+    inputs:
+      resume_run:
+        description: >-
+          Previous run ID whose demo branch should be reused.
+          Leave blank to use the current run ID.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -13,28 +20,43 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      RESUME_RUN: ${{ inputs.resume_run }}
     steps:
       - name: Open a pull request as GitHub Actions
         shell: bash
         run: |
           set -euo pipefail
-          branch="demo/review-checklist-${GITHUB_RUN_ID}"
-          mkdir -p docs
-          cat > docs/review-checklist.md <<'EOF'
+          run_id="${RESUME_RUN:-$GITHUB_RUN_ID}"
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          branch="demo/review-checklist-$run_id"
+          owner="${GH_REPO%/*}"
+          number=$(gh api --method GET "repos/$GH_REPO/pulls" -f head="$owner:$branch" \
+            -f state=all --jq '.[0].number // empty')
+          if [[ -z "$number" ]]; then
+            if ! gh api "repos/$GH_REPO/git/ref/heads/$branch" --silent 2>/dev/null; then
+              gh api "repos/$GH_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$GITHUB_SHA" --jq .ref
+            fi
+            if ! gh api --method GET "repos/$GH_REPO/contents/docs/review-checklist.md" \
+              -f ref="$branch" --silent 2>/dev/null; then
+              cat > review-checklist.md <<'EOF'
           # Чек-лист проверки pull request
 
           - Указана связанная задача.
           - Содержание изменений соответствует описанию.
-          - Рецензент проверил затронутые строки и оставил итог.
-          - После слияния обновлена локальная ветка main.
+          - Рецензент проверяет затронутые строки и оставляет итог.
+          - После слияния обновляется локальная ветка main.
           EOF
-          gh api "repos/$GH_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$GITHUB_SHA" --jq .ref
-          gh api --method PUT "repos/$GH_REPO/contents/docs/review-checklist.md" \
-            -f branch="$branch" -f message='Добавить чек-лист проверки pull request' \
-            -f content="$(base64 -w0 docs/review-checklist.md)" --jq .commit.sha
-          number=$(gh api "repos/$GH_REPO/pulls" -f head="$branch" -f base=main \
-            -f title='Добавить чек-лист проверки pull request' \
-            -f body='Учебное предложение от GitHub Actions. Чек-лист можно проверить перед слиянием. Closes #1.' --jq .number)
+              gh api --method PUT "repos/$GH_REPO/contents/docs/review-checklist.md" \
+                -f branch="$branch" -f message='Добавить чек-лист проверки pull request' \
+                -f content="$(base64 -w0 review-checklist.md)" --jq .commit.sha
+            fi
+            number=$(gh api "repos/$GH_REPO/pulls" -f head="$branch" -f base=main \
+              -f title='Добавить чек-лист проверки pull request' \
+              -f body='Учебное предложение от GitHub Actions. Чек-лист можно проверить перед слиянием. Closes #1.' --jq .number)
+          fi
           printf 'Pull request: https://github.com/%s/pull/%s\n' "$GH_REPO" "$number"
-          jq -n --arg login "${GH_REPO%/*}" '{reviewers: [$login]}' |
-            gh api "repos/$GH_REPO/pulls/$number/requested_reviewers" --input - --jq '.users[].login'
+          if [[ "$(gh api "repos/$GH_REPO/pulls/$number" --jq .state)" == open ]]; then
+            jq -n --arg login "$owner" '{reviewers: [$login]}' |
+              gh api "repos/$GH_REPO/pulls/$number/requested_reviewers" \
+                --input - --jq '.requested_reviewers[].login'
+          fi
